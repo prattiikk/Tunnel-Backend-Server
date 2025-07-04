@@ -1,0 +1,219 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================
+// AUTHENTICATION MODELS (NextAuth.js)
+// ============================================
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ============================================
+// USER MANAGEMENT
+// ============================================
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String    @unique
+  emailVerified DateTime?
+  image         String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  // Authentication relations
+  accounts Account[]
+  sessions Session[]
+
+  // Device authentication
+  deviceAuthCodes DeviceAuthCode[]
+
+  // Tunnel ownership
+  tunnels Tunnel[]
+
+  @@map("users")
+}
+
+// ============================================
+// DEVICE AUTHENTICATION
+// ============================================
+
+model DeviceAuthCode {
+  id        String   @id @default(cuid())
+  code      String   @unique
+  deviceId  String
+  createdAt DateTime @default(now())
+  expiresAt DateTime
+  userId    String?
+  token     String? // JWT or API key
+  isUsed    Boolean  @default(false)
+  claimed   Boolean  @default(false) // For backward compatibility
+
+  user User? @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([code])
+  @@index([expiresAt])
+  @@map("device_auth_codes")
+}
+
+// ============================================
+// TUNNEL MANAGEMENT
+// ============================================
+model Tunnel {
+  id          String   @id @default(cuid())
+  userId      String
+  name        String   @unique // This is now the tunnel identifier AND subdomain
+  description String?
+  port        Int      @default(3000)
+  isActive    Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Connection tracking fields
+  lastConnected    DateTime?
+  lastDisconnected DateTime?
+  connectedAt      DateTime?
+
+  // Tunnel configuration
+  protocol     String  @default("http")
+  customDomain String?
+
+  // Usage tracking
+  totalRequests  BigInt @default(0)
+  totalBandwidth BigInt @default(0)
+
+  // Relations
+  user        User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  liveStats   LiveStats?
+  hourlyStats HourlyStats[]
+  dailyStats  DailyStats[]
+  requestLogs RequestLog[]
+
+  @@index([userId])
+  @@index([isActive])
+  @@index([name]) // For quick tunnel lookups
+  @@index([lastConnected])
+  @@map("tunnels")
+}
+
+// ============================================
+// ANALYTICS & MONITORING
+// ============================================
+
+model LiveStats {
+  id                String   @id @default(cuid())
+  tunnelId          String   @unique
+  requestsLast5Min  Int      @default(0)
+  requestsLast1Hour Int      @default(0)
+  avgResponseTime   Float    @default(0)
+  errorRate         Int      @default(0)
+  lastUpdated       DateTime @default(now())
+
+  tunnel Tunnel @relation(fields: [tunnelId], references: [id], onDelete: Cascade)
+
+  @@map("live_stats")
+}
+
+model HourlyStats {
+  id              String   @id @default(cuid())
+  tunnelId        String
+  hour            DateTime
+  totalRequests   Int
+  successRequests Int
+  errorRequests   Int
+  avgResponseTime Float
+  totalBandwidth  BigInt
+  uniqueIps       Int
+  topPaths        Json
+  topCountries    Json
+  statusCodes     Json
+  createdAt       DateTime @default(now())
+
+  tunnel Tunnel @relation(fields: [tunnelId], references: [id], onDelete: Cascade)
+
+  @@unique([tunnelId, hour], name: "tunnelId_hour")
+  @@index([tunnelId, hour])
+  @@map("hourly_stats")
+}
+
+model DailyStats {
+  id              String   @id @default(cuid())
+  tunnelId        String
+  date            DateTime
+  totalRequests   Int
+  successRequests Int
+  errorRequests   Int
+  avgResponseTime Float
+  totalBandwidth  BigInt
+  uniqueIps       Int
+  peakHour        Int
+  createdAt       DateTime @default(now())
+
+  tunnel Tunnel @relation(fields: [tunnelId], references: [id], onDelete: Cascade)
+
+  @@unique([tunnelId, date], name: "tunnelId_date")
+  @@index([tunnelId, date])
+  @@map("daily_stats")
+}
+
+model RequestLog {
+  id           String   @id @default(cuid())
+  tunnelId     String
+  path         String
+  method       String
+  statusCode   Int
+  responseTime Int
+  requestSize  Int
+  responseSize Int
+  clientIp     String
+  country      String?
+  userAgent    String?
+  timestamp    DateTime @default(now())
+
+  tunnel Tunnel @relation(fields: [tunnelId], references: [id], onDelete: Cascade)
+
+  @@index([tunnelId, timestamp])
+  @@index([timestamp])
+  @@map("request_logs")
+}
