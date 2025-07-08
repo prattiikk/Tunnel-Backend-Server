@@ -17,6 +17,7 @@
     "express": "^5.1.0",
     "helmet": "^8.1.0",
     "hpp": "^0.2.3",
+    "http-proxy-middleware": "^3.0.5",
     "jsonwebtoken": "^9.0.2",
     "uuid": "^11.1.0",
     "ws": "^8.18.2",

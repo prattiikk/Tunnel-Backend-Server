@@ -150,10 +150,14 @@ export async function storeRespData(requestId, statusCode, responseTime, respons
 // stores all the logs to the database for given tunnel
 export async function storeRequestLog(metric) {
     try {
+        function normalizePath(path) {
+            return path.replace(/\/{2,}/g, '/'); // replaces double or more slashes with a single slash
+        }
+
         await prisma.requestLog.create({
             data: {
                 tunnelId: metric.tunnelId,
-                path: metric.path,
+                path: normalizePath(metric.path),
                 method: metric.method,
                 statusCode: metric.statusCode,
                 responseTime: metric.responseTime,
@@ -165,7 +169,6 @@ export async function storeRequestLog(metric) {
                 timestamp: metric.timestamp
             }
         });
-
         logWithTimestamp('DEBUG', `📝 Request log stored for tunnel ${metric.tunnelId}`);
     } catch (error) {
         logWithTimestamp('ERROR', `Failed to store request log for tunnel ${metric.tunnelId}`, {

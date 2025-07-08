@@ -251,38 +251,85 @@ wss.on('connection', (ws) => {
         }
 
         // Handle response messages
+
         else if (msg.type === 'response') {
-            const { id, statusCode, headers, body } = msg;
+            const { id, statusCode, headers, body, contentType } = msg;
             const res = pendingResponses.get(id);
 
             if (res) {
                 try {
-                    res.set(headers || {});
+                    // Clear timeout if it exists
+                    if (res.timeoutId) {
+                        clearTimeout(res.timeoutId);
+                        delete res.timeoutId;
+                    }
+
+                    // ✅ Set proper headers from agent response
+                    if (headers && typeof headers === 'object') {
+                        Object.entries(headers).forEach(([key, value]) => {
+                            res.set(key, value);
+                        });
+                    }
+
+                    // ✅ Handle different content types properly
                     let responseBody = body;
-                    if (typeof body === 'object' && body !== null) {
+                    const finalStatusCode = statusCode || 200;
+
+                    // Handle binary data (base64 encoded)
+                    if (typeof body === 'string' && headers && headers['content-encoding']) {
+                        responseBody = Buffer.from(body, 'base64');
+                    }
+                    // Handle JSON responses
+                    else if (typeof body === 'object' && body !== null) {
                         responseBody = JSON.stringify(body);
                         if (!res.get('content-type')) {
                             res.set('content-type', 'application/json');
                         }
                     }
-                    res.status(statusCode || 200).send(responseBody || '');
+                    // Handle text responses
+                    else if (typeof body === 'string') {
+                        responseBody = body;
+                        if (!res.get('content-type') && contentType) {
+                            res.set('content-type', contentType);
+                        }
+                    }
+
+                    // ✅ Send response and clean up
+                    res.status(finalStatusCode).send(responseBody || '');
                     pendingResponses.delete(id);
 
                     logWithTimestamp('DEBUG', `📤 Response forwarded`, {
                         requestId: id.substring(0, 8),
                         tunnelName,
-                        statusCode: statusCode || 200,
-                        bodyType: typeof body
+                        statusCode: finalStatusCode,
+                        contentType: res.get('content-type'),
+                        bodySize: responseBody ? responseBody.length : 0,
+                        headers: Object.keys(headers || {}).length
                     });
+
                 } catch (error) {
                     logWithTimestamp('ERROR', `Failed to send response`, {
                         requestId: id.substring(0, 8),
                         tunnelName,
                         error: error.message
                     });
+
+                    // Clean up
+                    pendingResponses.delete(id);
+
+                    if (!res.headersSent) {
+                        res.status(500).json({
+                            error: 'Response processing failed',
+                            message: error.message,
+                            requestId: id.substring(0, 8)
+                        });
+                    }
                 }
             } else {
-                logWithTimestamp('WARN', `No pending response found for request ID: ${id.substring(0, 8)}`);
+                logWithTimestamp('WARN', `No pending response found for request ID: ${id.substring(0, 8)}`, {
+                    tunnelName,
+                    pendingCount: pendingResponses.size
+                });
             }
         }
 
@@ -360,6 +407,7 @@ app.use(hpp());
 
 
 // HTTP tunnel endpoint with analytics - this is where we will send req with tunnel name so that it will forward this to 
+// Fixed HTTP tunnel endpoint with proper parallel request handling
 app.use(async (req, res) => {
     const pathParts = req.path.split('/').filter(part => part !== '');
 
@@ -401,7 +449,7 @@ app.use(async (req, res) => {
         });
     }
 
-    // find the web socket connection that is handling this tunnel using tunnel name
+    // Find the web socket connection that is handling this tunnel using tunnel name
     const agent = agents.get(name);
 
     if (!agent) {
@@ -418,35 +466,55 @@ app.use(async (req, res) => {
         });
     }
 
-
-
     // Start analytics tracking using tunnel.id
     const analyticsId = await storeReqData(req, res, tunnel.id);
     const requestId = uuidv4();
-    let body = '';
 
-    req.on('data', chunk => body += chunk);
+    // ✅ FIX #1: Store response object immediately with unique ID
+    pendingResponses.set(requestId, res);
+
+    // ✅ FIX #2: Handle request body collection properly
+    let body = '';
+    const chunks = [];
+
+    req.on('data', chunk => {
+        chunks.push(chunk);
+        body += chunk;
+    });
 
     req.on('end', () => {
-        pendingResponses.set(requestId, res);
-
         try {
-
-            // forward this to web socket so that it can send this to the agent and get back the response 
-            agent.send(JSON.stringify({
+            // ✅ FIX #3: Send complete request data to agent immediately
+            const requestData = {
                 type: 'request',
                 id: requestId,
                 method: req.method,
                 path: targetPath,
                 headers: req.headers,
-                body,
-            }));
+                body: body,
+                // Add query parameters
+                query: req.query,
+                // Add original URL for debugging
+                originalUrl: req.originalUrl
+            };
 
-            // Timeout handling
+            logWithTimestamp('DEBUG', `📨 Forwarding request to agent`, {
+                requestId: requestId.substring(0, 8),
+                method: req.method,
+                path: targetPath,
+                tunnelName: tunnel.name,
+                bodySize: body.length,
+                headers: Object.keys(req.headers).length
+            });
+
+            // Forward request to agent via WebSocket
+            agent.send(JSON.stringify(requestData));
+
+            // ✅ FIX #4: Proper timeout handling with cleanup
             const timeoutId = setTimeout(() => {
                 if (pendingResponses.has(requestId)) {
                     // Capture timeout as error
-                    storeRespData(analyticsId, 504, Date.now() - activeRequests.get(analyticsId)?.startTime || 0, 0);
+                    storeRespData(analyticsId, 504, Date.now() - (activeRequests.get(analyticsId)?.startTime || Date.now()), 0);
 
                     logWithTimestamp('WARN', `⏱️ Request timeout for tunnel ${tunnel.id}`, {
                         requestId: requestId.substring(0, 8),
@@ -455,30 +523,44 @@ app.use(async (req, res) => {
                         tunnelName: tunnel.name
                     });
 
-                    res.status(504).send('Request timed out');
+                    // Clean up and send timeout response
                     pendingResponses.delete(requestId);
-                }
-            }, 10000);
 
-            // Clear timeout if response comes back
-            const originalSend = res.send;
-            res.send = function (data) {
-                clearTimeout(timeoutId);
-                return originalSend.call(this, data);
-            };
+                    if (!res.headersSent) {
+                        res.status(504).json({
+                            error: 'Request timeout',
+                            message: 'The tunnel agent did not respond within the timeout period',
+                            requestId: requestId.substring(0, 8)
+                        });
+                    }
+                }
+            }, 30000); // 30 second timeout
+
+            // ✅ FIX #5: Store timeout ID for cleanup
+            if (!res.timeoutId) {
+                res.timeoutId = timeoutId;
+            }
 
         } catch (err) {
+            // Clean up on error
             pendingResponses.delete(requestId);
 
             // Capture error metrics
-            storeRespData(analyticsId, 500, Date.now() - activeRequests.get(analyticsId)?.startTime || 0, 0);
+            storeRespData(analyticsId, 500, Date.now() - (activeRequests.get(analyticsId)?.startTime || Date.now()), 0);
 
             logWithTimestamp('ERROR', `Failed to send request to tunnel ${tunnel.id}`, {
                 error: err.message,
                 requestId: requestId.substring(0, 8),
                 tunnelName: tunnel.name
             });
-            res.status(500).send('Internal tunnel error');
+
+            if (!res.headersSent) {
+                res.status(500).json({
+                    error: 'Internal tunnel error',
+                    message: 'Failed to forward request to tunnel agent',
+                    requestId: requestId.substring(0, 8)
+                });
+            }
         }
     });
 
@@ -488,14 +570,21 @@ app.use(async (req, res) => {
             requestId: requestId.substring(0, 8),
             tunnelName: tunnel.name
         });
+
         if (pendingResponses.has(requestId)) {
-            storeRespData(analyticsId, 400, Date.now() - activeRequests.get(analyticsId)?.startTime || 0, 0);
-            res.status(400).send('Bad request');
+            storeRespData(analyticsId, 400, Date.now() - (activeRequests.get(analyticsId)?.startTime || Date.now()), 0);
             pendingResponses.delete(requestId);
+
+            if (!res.headersSent) {
+                res.status(400).json({
+                    error: 'Bad request',
+                    message: 'Request processing failed',
+                    requestId: requestId.substring(0, 8)
+                });
+            }
         }
     });
 });
-
 
 
 // Process metrics buffer every 2 minutes
@@ -721,7 +810,33 @@ setInterval(() => {
 
 
 
+function cleanupStaleRequests() {
+    const now = Date.now();
+    const staleThreshold = 60000; // 1 minute
 
+    for (const [requestId, res] of pendingResponses) {
+        // Check if request is stale (you might want to add timestamp to track this)
+        if (res.startTime && (now - res.startTime) > staleThreshold) {
+            logWithTimestamp('WARN', `Cleaning up stale request: ${requestId.substring(0, 8)}`);
+
+            if (res.timeoutId) {
+                clearTimeout(res.timeoutId);
+            }
+
+            pendingResponses.delete(requestId);
+
+            if (!res.headersSent) {
+                res.status(408).json({
+                    error: 'Request timeout',
+                    message: 'Request was cleaned up due to timeout'
+                });
+            }
+        }
+    }
+}
+
+// Run cleanup every 30 seconds
+setInterval(cleanupStaleRequests, 30000);
 
 
 
