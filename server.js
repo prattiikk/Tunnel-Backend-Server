@@ -190,7 +190,7 @@ wss.on('connection', (ws) => {
                     agents.set(tunnelName, ws);
 
                     // Send success response
-                    const publicUrl = `${process.env.BASE_URL || 'http://localhost:8080'}/${tunnelRecord.name}`;
+                    const publicUrl = `${process.env.BASE_URL || 'http://localhost:8080'}${tunnelRecord.name}`;
 
                     ws.send(JSON.stringify({
                         type: 'registered',
